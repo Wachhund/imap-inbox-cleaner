@@ -6,131 +6,111 @@ import sys
 import os
 from socket import gaierror
 
+def setup_logger(log_path):
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.DEBUG,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger()
 
-def exception():
+def handle_exception():
     return logging.Formatter().formatException(sys.exc_info())
 
+def ensure_directory_exists(directory):
+    os.makedirs(directory, exist_ok=True)
 
-def init_imap(imap_host, username, password):
-    logger.info('Attempting imap login')
+def initialize_imap(imap_host, username, password, logger):
     try:
+        logger.info('Attempting IMAP login')
         mail = imaplib.IMAP4_SSL(imap_host)
         mail.login(username, password)
         logger.info('Successfully logged in')
         mail.select('Inbox')
-        status = mail.status('Inbox', '(MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN)')
-        logger.info('Inbox status\n{}'.format(status))
-        _, response = mail.status('Inbox', '(UIDVALIDITY)')
-        uidvalidity = response[0].split()[2].strip(').,]')
-        return uidvalidity, mail
+        return mail
     except imaplib.IMAP4.error:
-        logger.error('Failed to log in, please check user credentials\n{}'.format(exception()))
-        exit()
+        logger.error(f'Failed to log in. Please check user credentials.\n{handle_exception()}')
+        sys.exit(1)
     except gaierror:
-        logger.error('Failed to log in, please check host name\n{}'.format(exception()))
-        exit()
+        logger.error(f'Failed to log in. Please check host name.\n{handle_exception()}')
+        sys.exit(1)
 
+def fetch_email_header(mail, uid, retry_count, timeout_limit, timeout_wait, logger):
+    while retry_count <= timeout_limit:
+        if retry_count > 0:
+            logger.info(f'Retrying ({retry_count}/{timeout_limit})...')
+            time.sleep(timeout_wait)
 
-def fetched_count():
-    return len(store) - prev_store_count
+        try:
+            status, response = mail.uid('FETCH', uid, '(BODY.PEEK[HEADER])')
+            if status == 'OK':
+                logger.info(f'Successfully fetched header for UID {uid}')
+                return response[0][1]
+            else:
+                logger.warning(f'Problem fetching header for UID {uid}. Response: {response}')
+        except imaplib.IMAP4.abort:
+            logger.error(f'Connection closed by server while fetching UID {uid}.\n{handle_exception()}')
+        except Exception:
+            logger.error(f'Unexpected error while fetching UID {uid}.\n{handle_exception()}')
 
+        retry_count += 1
 
-def fetch_header(attempt_no, create_new_instance, uid):
-    global mail
-    if attempt_no > TIMOUT_LIMIT:
-        logger.error('Time out limit reached, only fetched {} emails'.format(fetched_count()))
-        write_store()
-        exit()
-    if attempt_no > 0:
-        logger.info('Timeout {}...'.format(attempt_no))
-        time.sleep(TIMEOUT_WAIT)
-        if create_new_instance:
-            logger.info('Creating new imap instance')
-            _, mail = init_imap(IMAP_HOST, USERNAME, PASSWORD)
-        logger.info('Reattempting to download header for email_uid {}'.format(uid))
-    try:
-        status, response = mail.uid('FETCH', uid, '(BODY.PEEK[HEADER])')
-        payload = response[0][1]
-        if status != 'OK':
-            logger.info('Encountered problem whilst downloading header for email_uid {}\nResponse received:\n{}'.format(uid, response))
-            return fetch_header(attempt_no + 1, False, uid)
-        elif attempt_no > 0:
-            logger.info('Successfully downloaded header for email_uid {}'.format(uid))
-            logger.info('Progress report: {} emails downloaded, {} remaining'.format(fetched_count(), len(uids_to_fetch) - fetched_count()))
-        return payload
-    except imaplib.IMAP4.abort:
-        logger.error('Connection closed by server whilst processing email_uid {}\n{}'.format(uid, exception()))
-        return fetch_header(attempt_no + 1, True, uid)
-    except BaseException:
-        logger.error('Unexpected error whilst processing email_uid {}, only fetched {} emails\n{}'.format(uid, fetched_count(), exception()))
-        write_store()
-        exit()
+    logger.error(f'Failed to fetch UID {uid} after {timeout_limit} retries.')
+    return None
 
-
-def write_store():
-    with open(DATA_PATH, 'w') as fp:
-        json.dump(store, fp, sort_keys=True)
-
-
-def create_directory(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-
-def init_logger(log_path):
-    logging.basicConfig(filename=log_path, level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s\n',
-                        datefmt='%m/%d/%Y %H:%M:%S')
-
-
-logger = logging.getLogger()
-
-if __name__ == "__main__":
-
-    args = len(sys.argv)
-
-    if (args < 4):
-        print ('Usage: python fetch.py <imap_host> <username> <password>')
-        exit()
+def load_store(data_path, logger):
+    if os.path.isfile(data_path):
+        with open(data_path, 'r') as file:
+            store = json.load(file)
+        logger.info(f'Loaded {len(store)} emails from existing store')
+        return store
     else:
-        IMAP_HOST = sys.argv[1]
-        USERNAME = sys.argv[2]
-        PASSWORD = sys.argv[3]
+        logger.info('No existing store found. Starting fresh.')
+        return {}
 
-    DATA_PATH = USERNAME + '/data.json'
-    LOG_PATH = USERNAME + '/fetch.log'
-    TIMEOUT_WAIT = 30
-    TIMOUT_LIMIT = 3
+def save_store(store, data_path):
+    with open(data_path, 'w') as file:
+        json.dump(store, file, sort_keys=True)
 
-    create_directory(USERNAME)
+def main():
+    if len(sys.argv) < 4:
+        print('Usage: python fetch.py <imap_host> <username> <password>')
+        sys.exit(1)
 
-    init_logger(LOG_PATH)
+    imap_host, username, password = sys.argv[1:4]
 
-    prev_store_count = 0
+    data_path = os.path.join(username, 'data.json')
+    log_path = os.path.join(username, 'fetch.log')
+    timeout_wait = 30
+    timeout_limit = 3
 
-    if (os.path.isfile(DATA_PATH)):
-        store = json.load(open(DATA_PATH))
-        prev_store_count = len(store)
-        logger.info('Loaded {} emails from existing store'.format(prev_store_count))
-    else:
-        store = {}
-        logger.info('Created new store')
+    ensure_directory_exists(username)
+    logger = setup_logger(log_path)
 
-    _, mail = init_imap(IMAP_HOST, USERNAME, PASSWORD)
+    store = load_store(data_path, logger)
+    previous_store_count = len(store)
 
+    mail = initialize_imap(imap_host, username, password, logger)
+
+    logger.info('Fetching unread emails...')
     _, data = mail.uid('SEARCH', None, '(UNSEEN)')
-    unread_msg_uids = data[0].split()
-    uids_to_fetch = list(set(unread_msg_uids) ^ set(store.keys()))
+    unread_uids = set(data[0].split())
+    new_uids = unread_uids - store.keys()
 
-    logger.info('{} unread emails on server'.format(len(unread_msg_uids)))
-    logger.info('Attempting to fetch {} emails ({} in store)'.format(len(uids_to_fetch), len(store.keys())))
+    logger.info(f'{len(unread_uids)} unread emails found, {len(new_uids)} new to fetch.')
 
-    start = time.time()
+    start_time = time.time()
 
-    for uid in uids_to_fetch:
-        header = fetch_header(0, False, uid)
-        store[uid] = unicode(header, errors='ignore')
+    for uid in new_uids:
+        header = fetch_email_header(mail, uid, 0, timeout_limit, timeout_wait, logger)
+        if header:
+            store[uid.decode()] = header.decode(errors='ignore')
 
-    write_store()
-    end = time.time()
-    logger.info('Completed, fetched {} emails, time elapsed: {:.1f}s'.format(fetched_count(), end - start))
+    save_store(store, data_path)
+
+    elapsed_time = time.time() - start_time
+    logger.info(f'Completed fetching. Fetched {len(new_uids)} emails in {elapsed_time:.1f} seconds.')
+
+if __name__ == '__main__':
+    main()
