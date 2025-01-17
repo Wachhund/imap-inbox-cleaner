@@ -6,6 +6,8 @@ import sys
 import os
 from socket import gaierror
 
+imaplib._MAXLINE = 10_000_000  # Higher limit for imaplib
+
 def setup_logger(log_path):
     logging.basicConfig(
         filename=log_path,
@@ -21,13 +23,18 @@ def handle_exception():
 def ensure_directory_exists(directory):
     os.makedirs(directory, exist_ok=True)
 
-def initialize_imap(imap_host, username, password, logger):
+def initialize_imap(imap_host, imap_port, username, password, mailbox, logger):
     try:
         logger.info('Attempting IMAP login')
-        mail = imaplib.IMAP4_SSL(imap_host)
+        
+        # mail = imaplib.IMAP4_SSL(imap_host, imap_port) # SSL
+        #STARTTLS
+        mail = imaplib.IMAP4(imap_host, imap_port)
+        mail.starttls()
+
         mail.login(username, password)
         logger.info('Successfully logged in')
-        mail.select('Inbox')
+        mail.select(f'"{mailbox}"')
         return mail
     except imaplib.IMAP4.error:
         logger.error(f'Failed to log in. Please check user credentials.\n{handle_exception()}')
@@ -73,15 +80,44 @@ def save_store(store, data_path):
     with open(data_path, 'w') as file:
         json.dump(store, file, sort_keys=True)
 
-def main():
+def is_valid_port(value):
+    try:
+        port = int(value)
+        return 1 <= port <= 65535
+    except ValueError:
+        return False
+
+def parse_arguments():
     if len(sys.argv) < 4:
-        print('Usage: python fetch.py <imap_host> <username> <password>')
+        print('Usage: python fetch.py <imap_host> <username> <password> [mailbox] [imap_port]')
         sys.exit(1)
 
-    imap_host, username, password = sys.argv[1:4]
+    imap_host = sys.argv[1]
+    username = sys.argv[2]
+    password = sys.argv[3]
+    mailbox = 'Inbox'
+    imap_port = 993
 
-    data_path = os.path.join(username, 'data.json')
-    log_path = os.path.join(username, 'fetch.log')
+    if len(sys.argv) > 4:
+        if is_valid_port(sys.argv[4]):
+            imap_port = int(sys.argv[4])
+        else:
+            mailbox = sys.argv[4]
+
+    if len(sys.argv) > 5:
+        if is_valid_port(sys.argv[5]):
+            imap_port = int(sys.argv[5])
+        else:
+            print('Error: Invalid port number provided.')
+            sys.exit(1)
+
+    return imap_host, username, password, mailbox, imap_port
+
+def main():
+    imap_host, username, password, mailbox, imap_port = parse_arguments()
+
+    data_path = os.path.join(username, 'data_unseen.json')
+    log_path = os.path.join(username, 'fetch_unseen.log')
     timeout_wait = 30
     timeout_limit = 3
 
@@ -91,10 +127,10 @@ def main():
     store = load_store(data_path, logger)
     previous_store_count = len(store)
 
-    mail = initialize_imap(imap_host, username, password, logger)
+    mail = initialize_imap(imap_host, imap_port, username, password, mailbox, logger)
 
-    logger.info('Fetching unread emails...')
-    _, data = mail.uid('SEARCH', None, '(UNSEEN)')
+    logger.info(f'Fetching unread emails from mailbox: {mailbox}...')
+    _, data = mail.uid('SEARCH', None, '(SEEN)')
     unread_uids = set(data[0].split())
     new_uids = unread_uids - store.keys()
 
